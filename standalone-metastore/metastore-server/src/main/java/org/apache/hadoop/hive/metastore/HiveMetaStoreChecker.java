@@ -318,67 +318,43 @@ public class HiveMetaStoreChecker {
       return;
     }
 
-    // now check the table folder and see if we find anything
-    // that isn't in the metastore
-    Set<Path> allPartDirs = new HashSet<>();
     List<FieldSchema> partColumns = table.getPartitionKeys();
-    checkPartitionDirs(tablePath, allPartDirs, Collections.unmodifiableList(getPartColNames(table)));
+    List<String> partColNames = Collections.unmodifiableList(getPartColNames(table));
     String tablePathStr = tablePath.toString();
-    int tablePathLength = tablePathStr.length();
+    int tablePathStrLen = tablePathStr.endsWith("/") ? tablePathStr.length() : tablePathStr.length() + 1;
+    boolean transactionalTable = TxnUtils.isTransactionalTable(table);
 
-    if (filterExp != null) {
-      PartitionExpressionProxy expressionProxy = createExpressionProxy(conf);
-      List<String> partitions = new ArrayList<>();
-      Set<Path> partDirs = new HashSet<Path>();
-      boolean tablePathStrEndsWith = tablePathStr.endsWith("/");
-      int tablePathStrLen = tablePathStr.endsWith("/") ? tablePathStr.length() : tablePathStr.length() + 1;
-      allPartDirs.stream().forEach(path -> partitions.add(path.toString().substring(tablePathStrLen)));
-
-      // Remove all partition paths which does not matches the filter expression.
-      expressionProxy.filterPartitionsByExpr(partColumns, filterExp,
-              conf.get(MetastoreConf.ConfVars.DEFAULTPARTITIONNAME.getVarname()), partitions);
-
-      // now the partition list will contain all the paths that matches the filter expression.
-      // add them back to partDirs.
-      for (String path : partitions) {
-        partDirs.add(new Path(tablePath, path));
-      }
-      allPartDirs = partDirs;
-    }
-
-    // check that the partition folders exist on disk
+    // Build a set of existing partition paths from metastore for O(1) lookup.
+    // This holds Path objects (~100 bytes each) rather than full Partition objects (~2KB).
+    Set<Path> existingPartPaths = new HashSet<>();
     for (Partition partition : parts) {
       if (partition == null) {
-        // most likely the user specified an invalid partition
         continue;
       }
       Path partPath = getDataLocation(table, partition);
       if (partPath == null) {
         continue;
       }
-      fs = partPath.getFileSystem(conf);
+
+      existingPartPaths.add(partPath);
+
+      // Check if this metastore partition's path exists on filesystem
+      FileSystem partFs = partPath.getFileSystem(conf);
       CheckResult.PartitionResult prFromMetastore = new CheckResult.PartitionResult();
       prFromMetastore.setPartitionName(getPartitionName(table, partition));
       prFromMetastore.setTableName(partition.getTableName());
-      if (allPartDirs.remove(partPath)) {
-        result.getCorrectPartitions().add(prFromMetastore);
-      } else {
-        // There can be edge case where user can define partition directory outside of table directory
-        // to avoid eviction of such partitions
-        // we check existence of partition path which are not in table directory
-        if (!partPath.toString().contains(tablePathStr)) {
-          if (!fs.exists(partPath)) {
-            result.getPartitionsNotOnFs().add(prFromMetastore);
-          } else {
-            result.getCorrectPartitions().add(prFromMetastore);
-          }
-        } else {
-          // If Partition Path contains table path, we assume to be non-existent partition since
-          // Partition spec has to be in format FS://<TablePath>/<PartKeyName>=<PartValue>
-          // otherwise partition discovery may fail.
+
+      // We'll mark it as "correct" or "not on fs" after we discover filesystem paths.
+      // For now, track it — we'll reconcile below.
+      if (!partPath.toString().contains(tablePathStr)) {
+        // Partition path is outside table directory — check existence directly
+        if (!partFs.exists(partPath)) {
           result.getPartitionsNotOnFs().add(prFromMetastore);
+        } else {
+          result.getCorrectPartitions().add(prFromMetastore);
         }
       }
+      // Partitions within table directory will be reconciled against discovered paths
 
       if (partitionExpirySeconds > 0) {
         long currentEpochSecs = Instant.now().getEpochSecond();
@@ -398,9 +374,110 @@ public class HiveMetaStoreChecker {
       }
     }
 
-    findUnknownPartitions(table, allPartDirs, result);
+    // Track which existing partition paths were found on filesystem
+    Set<Path> existingPathsFoundOnFs = new HashSet<>();
 
-    if (!isPartitioned(table) && TxnUtils.isTransactionalTable(table)) {
+    // Set up optional filter expression proxy
+    PartitionExpressionProxy expressionProxy = null;
+    if (filterExp != null) {
+      expressionProxy = createExpressionProxy(conf);
+    }
+
+    // Discover partition directories in bounded-memory batches and process incrementally.
+    // Instead of collecting ALL discovered paths into a Set, we process each batch:
+    // 1. Apply filter expression (if any)
+    // 2. Check against existing metastore partitions
+    // 3. Add unknown partitions to result immediately
+    int batchSize = MetastoreConf.getIntVar(conf, MetastoreConf.ConfVars.MSCK_REPAIR_BATCH_SIZE);
+    if (batchSize <= 0) {
+      batchSize = 3000;
+    }
+
+    Set<String> partColNamesSet = Sets.newHashSet();
+    for (FieldSchema fSchema : getPartCols(table)) {
+      partColNamesSet.add(fSchema.getName());
+    }
+    Map<String, String> partitionColToTypeMap = getPartitionColtoTypeMap(table.getPartitionKeys());
+
+    try (PartitionPathIterator pathIter = new PartitionPathIterator(
+            tablePath, fs, partColNames, batchSize, conf)) {
+      while (pathIter.hasNext()) {
+        List<Path> batch = pathIter.next();
+
+        // Apply filter expression per-batch if specified
+        if (filterExp != null) {
+          List<String> batchRelPaths = new ArrayList<>(batch.size());
+          for (Path p : batch) {
+            batchRelPaths.add(p.toString().substring(tablePathStrLen));
+          }
+          expressionProxy.filterPartitionsByExpr(partColumns, filterExp,
+              conf.get(MetastoreConf.ConfVars.DEFAULTPARTITIONNAME.getVarname()), batchRelPaths);
+          // Rebuild batch with only paths that passed the filter
+          Set<String> passingPaths = new HashSet<>(batchRelPaths);
+          batch = new ArrayList<>();
+          for (String rel : passingPaths) {
+            batch.add(new Path(tablePath, rel));
+          }
+        }
+
+        // Process each discovered path against existing metastore partitions
+        for (Path partPath : batch) {
+          if (existingPartPaths.contains(partPath)) {
+            // This path exists both on filesystem and in metastore — correct
+            existingPathsFoundOnFs.add(partPath);
+          } else {
+            // Path exists on filesystem but NOT in metastore — unknown partition
+            String partitionName = getPartitionName(fs.makeQualified(tablePath),
+                partPath, partColNamesSet, partitionColToTypeMap, conf);
+            if (partitionName == null) {
+              LOG.warn("Skipping partition: " + partPath.getName());
+              continue;
+            }
+            CheckResult.PartitionResult pr = new CheckResult.PartitionResult();
+            pr.setPartitionName(partitionName);
+            pr.setTableName(table.getTableName());
+            pr.setPath(partPath);
+
+            if (result.getPartitionsNotInMs().contains(pr)) {
+              throw new MetastoreException(
+                  "Found two paths for same partition '" + pr + "' for table " + table.getTableName());
+            }
+            if (transactionalTable) {
+              setMaxTxnAndWriteIdFromPartition(partPath, pr);
+            }
+            result.getPartitionsNotInMs().add(pr);
+          }
+        }
+      }
+      if (pathIter.getException() != null) {
+        throw new MetastoreException(pathIter.getException());
+      }
+    }
+
+    // Any existing metastore partition whose path is within the table directory
+    // but was NOT found during filesystem discovery is "not on filesystem"
+    for (Partition partition : parts) {
+      if (partition == null) {
+        continue;
+      }
+      Path partPath = getDataLocation(table, partition);
+      if (partPath == null) {
+        continue;
+      }
+      // Only check partitions within the table directory (external paths handled above)
+      if (partPath.toString().contains(tablePathStr)) {
+        CheckResult.PartitionResult prFromMetastore = new CheckResult.PartitionResult();
+        prFromMetastore.setPartitionName(getPartitionName(table, partition));
+        prFromMetastore.setTableName(partition.getTableName());
+        if (existingPathsFoundOnFs.contains(partPath)) {
+          result.getCorrectPartitions().add(prFromMetastore);
+        } else {
+          result.getPartitionsNotOnFs().add(prFromMetastore);
+        }
+      }
+    }
+
+    if (!isPartitioned(table) && transactionalTable) {
       // Check for writeIds in the table directory
       CheckResult.PartitionResult tableResult = new CheckResult.PartitionResult();
       setMaxTxnAndWriteIdFromPartition(tablePath, tableResult);
