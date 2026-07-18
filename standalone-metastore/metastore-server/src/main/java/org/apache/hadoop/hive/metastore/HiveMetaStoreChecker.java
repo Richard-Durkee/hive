@@ -95,6 +95,15 @@ public class HiveMetaStoreChecker {
   public static final PathFilter HIDDEN_FILES_PATH_FILTER =
       p -> !p.getName().startsWith("_") && !p.getName().startsWith(".");
 
+  /**
+   * A consumer that can throw checked exceptions.
+   * Used for callback-based partition directory processing.
+   */
+  @FunctionalInterface
+  interface ThrowingConsumer<T> {
+    void accept(T t) throws MetastoreException, MetaException, IOException;
+  }
+
   public HiveMetaStoreChecker(IMetaStoreClient msc, Configuration conf) {
     this(msc, conf, -1);
   }
@@ -318,68 +327,118 @@ public class HiveMetaStoreChecker {
       return;
     }
 
-    // now check the table folder and see if we find anything
-    // that isn't in the metastore
-    Set<Path> allPartDirs = new HashSet<>();
+    // Build set of existing partition paths from metastore
+    // This is bounded by the number of partitions in the metastore (already loaded)
+    Set<Path> existingPartPaths = new HashSet<>();
     List<FieldSchema> partColumns = table.getPartitionKeys();
-    checkPartitionDirs(tablePath, allPartDirs, Collections.unmodifiableList(getPartColNames(table)));
     String tablePathStr = tablePath.toString();
-    int tablePathLength = tablePathStr.length();
 
-    if (filterExp != null) {
-      PartitionExpressionProxy expressionProxy = createExpressionProxy(conf);
-      List<String> partitions = new ArrayList<>();
-      Set<Path> partDirs = new HashSet<Path>();
-      boolean tablePathStrEndsWith = tablePathStr.endsWith("/");
-      int tablePathStrLen = tablePathStr.endsWith("/") ? tablePathStr.length() : tablePathStr.length() + 1;
-      allPartDirs.stream().forEach(path -> partitions.add(path.toString().substring(tablePathStrLen)));
-
-      // Remove all partition paths which does not matches the filter expression.
-      expressionProxy.filterPartitionsByExpr(partColumns, filterExp,
-              conf.get(MetastoreConf.ConfVars.DEFAULTPARTITIONNAME.getVarname()), partitions);
-
-      // now the partition list will contain all the paths that matches the filter expression.
-      // add them back to partDirs.
-      for (String path : partitions) {
-        partDirs.add(new Path(tablePath, path));
-      }
-      allPartDirs = partDirs;
-    }
-
-    // check that the partition folders exist on disk
     for (Partition partition : parts) {
       if (partition == null) {
-        // most likely the user specified an invalid partition
+        continue;
+      }
+      Path partPath = getDataLocation(table, partition);
+      if (partPath != null) {
+        existingPartPaths.add(partPath);
+      }
+    }
+
+    // Set up filter expression proxy if needed
+    final PartitionExpressionProxy expressionProxy = filterExp != null
+        ? createExpressionProxy(conf) : null;
+    final int tablePathStrLen = tablePathStr.endsWith("/")
+        ? tablePathStr.length() : tablePathStr.length() + 1;
+
+    // Track partitions found on filesystem but not in metastore
+    Set<Path> partitionsNotInMs = new HashSet<>();
+
+    // Set up executor for parallel directory listing
+    int poolSize = MetastoreConf.getIntVar(conf, MetastoreConf.ConfVars.FS_HANDLER_THREADS_COUNT);
+    int batchSize = MetastoreConf.getIntVar(conf, MetastoreConf.ConfVars.BATCH_RETRIEVE_MAX);
+    if (batchSize <= 0) {
+      batchSize = 1000; // Default batch size for incremental processing
+    }
+
+    ExecutorService executor;
+    if (poolSize <= 1) {
+      LOG.debug("Using single-threaded version of MSCK-GetPaths");
+      executor = MoreExecutors.newDirectExecutorService();
+    } else {
+      LOG.debug("Using multi-threaded version of MSCK-GetPaths with number of threads " + poolSize);
+      ThreadFactory threadFactory =
+          new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MSCK-GetPaths-%d").build();
+      executor = Executors.newFixedThreadPool(poolSize, threadFactory);
+    }
+
+    try {
+      // Use callback-based incremental BFS to avoid collecting all paths in memory
+      checkPartitionDirsIncremental(executor, tablePath, fs,
+          Collections.unmodifiableList(getPartColNames(table)), batchSize,
+          (Path fsPath) -> {
+            // Apply filter expression if present
+            if (expressionProxy != null) {
+              String relPath = fsPath.toString().substring(tablePathStrLen);
+              List<String> singlePath = new ArrayList<>();
+              singlePath.add(relPath);
+              expressionProxy.filterPartitionsByExpr(partColumns, filterExp,
+                  conf.get(MetastoreConf.ConfVars.DEFAULTPARTITIONNAME.getVarname()), singlePath);
+              if (singlePath.isEmpty()) {
+                // Filtered out by expression
+                return;
+              }
+            }
+
+            // Check if this filesystem path is in the metastore
+            if (existingPartPaths.contains(fsPath)) {
+              // Path exists in both - will be marked correct during second pass
+              // Remove from existingPartPaths so second pass knows it was found on FS
+              existingPartPaths.remove(fsPath);
+            } else {
+              // Path on filesystem but not in metastore
+              partitionsNotInMs.add(fsPath);
+            }
+          });
+    } finally {
+      executor.shutdown();
+    }
+
+    // Second pass: reconcile metastore partitions with filesystem findings
+    // At this point:
+    // - existingPartPaths contains paths that were in metastore but NOT found on filesystem
+    // - partitionsNotInMs contains paths found on filesystem but NOT in metastore
+    for (Partition partition : parts) {
+      if (partition == null) {
         continue;
       }
       Path partPath = getDataLocation(table, partition);
       if (partPath == null) {
         continue;
       }
-      fs = partPath.getFileSystem(conf);
+
       CheckResult.PartitionResult prFromMetastore = new CheckResult.PartitionResult();
       prFromMetastore.setPartitionName(getPartitionName(table, partition));
       prFromMetastore.setTableName(partition.getTableName());
-      if (allPartDirs.remove(partPath)) {
+
+      if (!existingPartPaths.contains(partPath)) {
+        // Path was removed from existingPartPaths during BFS, meaning it was found on FS
         result.getCorrectPartitions().add(prFromMetastore);
       } else {
-        // There can be edge case where user can define partition directory outside of table directory
-        // to avoid eviction of such partitions
-        // we check existence of partition path which are not in table directory
+        // Path still in existingPartPaths means it was NOT found during BFS
+        // Check if partition is outside table directory (edge case)
         if (!partPath.toString().contains(tablePathStr)) {
-          if (!fs.exists(partPath)) {
+          // Partition outside table directory - check existence directly
+          FileSystem partFs = partPath.getFileSystem(conf);
+          if (!partFs.exists(partPath)) {
             result.getPartitionsNotOnFs().add(prFromMetastore);
           } else {
             result.getCorrectPartitions().add(prFromMetastore);
           }
         } else {
-          // If Partition Path contains table path, we assume to be non-existent partition since
-          // Partition spec has to be in format FS://<TablePath>/<PartKeyName>=<PartValue>
-          // otherwise partition discovery may fail.
           result.getPartitionsNotOnFs().add(prFromMetastore);
         }
       }
 
+      // Check partition expiry
       if (partitionExpirySeconds > 0) {
         long currentEpochSecs = Instant.now().getEpochSecond();
         long createdTime = partition.getCreateTime();
@@ -398,7 +457,8 @@ public class HiveMetaStoreChecker {
       }
     }
 
-    findUnknownPartitions(table, allPartDirs, result);
+    // Process partitions found on filesystem but not in metastore
+    findUnknownPartitions(table, partitionsNotInMs, result);
 
     if (!isPartitioned(table) && TxnUtils.isTransactionalTable(table)) {
       // Check for writeIds in the table directory
@@ -692,6 +752,83 @@ public class HiveMetaStoreChecker {
       LOG.error("Exception received while listing partition directories", e);
       executor.shutdownNow();
       throw new MetastoreException(e.getCause());
+    }
+  }
+
+  /**
+   * Callback-based incremental partition directory discovery.
+   * <p>
+   * Unlike {@link #checkPartitionDirs(ExecutorService, Path, Set, FileSystem, List)} which
+   * collects all partition paths into memory before returning, this method invokes the
+   * callback for each discovered partition path immediately. This prevents OOM when
+   * scanning tables with millions of partitions (HIVE-12859).
+   * <p>
+   * Uses a level-parallel BFS with batched future submission to bound memory usage.
+   *
+   * @param executor  Thread pool for parallel directory listing
+   * @param basePath  Table base path
+   * @param fs        FileSystem instance
+   * @param partColNames  Partition column names (determines BFS depth)
+   * @param batchSize Maximum futures to submit before draining results
+   * @param callback  Called for each discovered partition path
+   * @throws MetastoreException On validation errors or callback exceptions
+   * @throws IOException On filesystem errors
+   */
+  @VisibleForTesting
+  void checkPartitionDirsIncremental(final ExecutorService executor,
+      final Path basePath, final FileSystem fs, final List<String> partColNames,
+      final int batchSize, final ThrowingConsumer<Path> callback)
+      throws MetastoreException, MetaException, IOException {
+    try {
+      Queue<Future<Path>> futures = new LinkedList<>();
+      ConcurrentLinkedQueue<PathDepthInfo> nextLevel = new ConcurrentLinkedQueue<>();
+      nextLevel.add(new PathDepthInfo(basePath, 0));
+
+      // Level-parallel BFS with batched future submission
+      while (!nextLevel.isEmpty()) {
+        ConcurrentLinkedQueue<PathDepthInfo> tempQueue = new ConcurrentLinkedQueue<>();
+
+        // Process each level in parallel, batching submissions
+        while (!nextLevel.isEmpty()) {
+          futures.add(
+              executor.submit(new PathDepthInfoCallable(nextLevel.poll(), partColNames, fs, tempQueue)));
+
+          // Drain futures when batch size reached to bound memory
+          if (futures.size() >= batchSize) {
+            drainFuturesWithCallback(futures, callback);
+          }
+        }
+
+        // Drain any remaining futures from this level
+        drainFuturesWithCallback(futures, callback);
+
+        // Move to next level
+        nextLevel = tempQueue;
+      }
+    } catch (InterruptedException | ExecutionException e) {
+      LOG.error("Exception received while listing partition directories", e);
+      executor.shutdownNow();
+      Throwable cause = e.getCause();
+      if (cause instanceof MetastoreException) {
+        throw (MetastoreException) cause;
+      } else if (cause instanceof IOException) {
+        throw (IOException) cause;
+      }
+      throw new MetastoreException(cause);
+    }
+  }
+
+  /**
+   * Drain all futures, invoking callback for each non-null result.
+   */
+  private void drainFuturesWithCallback(Queue<Future<Path>> futures,
+      ThrowingConsumer<Path> callback)
+      throws InterruptedException, ExecutionException, MetastoreException, MetaException, IOException {
+    while (!futures.isEmpty()) {
+      Path p = futures.poll().get();
+      if (p != null) {
+        callback.accept(p);
+      }
     }
   }
 }
